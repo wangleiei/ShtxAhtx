@@ -41,27 +41,40 @@ static uint16_t SHT3X_crc8(unsigned char *addr,uint8_t num);
 uint8_t Sht3xInit(SHT3X_DEV* base,
 	void (*read)(uint8_t,uint16_t,uint8_t*,uint8_t),
 	void (*write)(uint8_t,uint16_t,uint8_t*,uint8_t),
-	uint8_t dev_addr,
-	SH_DEV_TYPE sh_dev_type){
+	uint8_t i2cdev_addr,
+	SH_DEV_TYPE sh_dev_type,
+	void (*delayms)(uint8_t)){
 	base->read = read;
+	base->AhtIicRead = 0;
 	base->write = write;
+
+	base->delayms = delayms;
+	base->delayms_sta_count = 0;
+
 	base->badrh_crc_count = base->goodrh_crc_count = base->badtp_crc_count = base->goodtp_crc_count = 0;
 
-	base->dev_addr = dev_addr;
+	base->i2cdev_addr = i2cdev_addr;
+	
+	base->sh_dev_type = sh_dev_type;
 
 	if(base->sh_dev_type == SHTX){
-		SHT3X_soft_reset(base);
-		set_SHT3x_Periodic_mode(base, MPS_1HZ,REFRESH_HIGH);			//设置温湿度传感器输出方式		
-	}else if(base->sh_dev_type == AHTX){
-		uint8_t temp[] = {0x08,0x00};
-		base->dev_addr = 0x70;
 		Sht3xSoftReset(base);
-		base->write(base->dev_addr,0xe1,temp,sizeof(temp));
-
+		SetSht3xPeriodicMode(base, MPS_1HZ,REFRESH_HIGH);			//设置温湿度传感器输出方式		
+	}else if(base->sh_dev_type == AHTX){
+		uint8_t temp[2] = {0x08,0x00};//数据手册上没有这个 但是很多地方的例子都有
+		base->i2cdev_addr = 0x38;
+		Sht3xSoftReset(base);
+		base->delayms(30);
+		// 5.4 软复位这个命令（见表9）用于在无需关闭和再次打开电源的情况下，重新启动传感器系统。在接收到这个命令之后，
+		// 传感器系统开始重新初始化，并恢复默认设置状态，软复位所需时间不超过20毫秒。
+		base->write(base->i2cdev_addr,0xe1,temp,2);
 	}
 	return 0;
 }
 
+void Sht3xInitAddInterface(SHT3X_DEV* base,void(*AhtIicRead)(uint8_t *,uint16_t)){
+	base->AhtIicRead = AhtIicRead;
+}
 //***********************************************************************************************
 // 函 数 名 : Check_SHT3X
 // 输入参数 : NONE
@@ -73,7 +86,7 @@ uint8_t CheckSht3xInLine(SHT3X_DEV* base)
 {
 	uint8_t ReadBuf[2];
 	return 0;
-	base->read(base->dev_addr,0xE000,ReadBuf,2);	
+	base->read(base->i2cdev_addr,0xE000,ReadBuf,2);	
 	if((ReadBuf[0] != 0) && (ReadBuf[0] != 0xff))
 	{
 		return 0;
@@ -96,14 +109,14 @@ void Sht3xSoftReset(SHT3X_DEV* base)
 	}else if(base->sh_dev_type == AHTX){
 		temp = 0xba;		
 	}
-	base->write(base->dev_addr,temp,&buf,0);
+	base->write(base->i2cdev_addr,temp,&buf,0);
 }
 /**********************************************************************************************************
 *	函 数 名: void SHT3X_temperature_humidity(SHT3X_DEV* base,float *TEMP_ADCVal,float *RH_ADCVal)
 *	功能说明: 读取温度函数
 *	传    参: float *TEMP_ADCVal 温度比如23.9摄氏度
 			  float *RH_ADCVal 89 百分之89湿度
-*	返 回 值: 0:成功采集数据1：失败
+*	返 回 值: 0:成功采集数据1：失败,2：采集中
 *   说    明: 
 *********************************************************************************************************/
 int Sht3xTemperatureHumidity(SHT3X_DEV* base,float *temp_adcval,float *rh_adcval)
@@ -112,7 +125,7 @@ int Sht3xTemperatureHumidity(SHT3X_DEV* base,float *temp_adcval,float *rh_adcval
 	uint16_t temp = 0;
 	uint16_t remp = 0;
 	if(base->sh_dev_type == SHTX){
-		base->read(base->dev_addr,0xE000,ReadBuf,6);	
+		base->read(base->i2cdev_addr,0xE000,ReadBuf,6);	
 
 		temp = (ReadBuf[0]<<8) + ReadBuf[1];
 		remp = (ReadBuf[3]<<8) + ReadBuf[4];
@@ -137,23 +150,40 @@ int Sht3xTemperatureHumidity(SHT3X_DEV* base,float *temp_adcval,float *rh_adcval
 		}
 		return temp;
 	}else if(base->sh_dev_type == AHTX){
+		uint8_t merse[2] = {0x33,0x00};
 		uint32_t temp = 0;
 		uint32_t hump = 0;
-		base->read(base->dev_addr,0x0000,ReadBuf,6);
-		if((0x80 & ReadBuf[0] || (0xff == ReadBuf[0]))){return 1;}
+		// 发出测量命令
+		if(base->delayms_sta_count == 0){
+			base->write(base->i2cdev_addr,0xAC,merse,2);
+		}
+		base->delayms(1);
+		// 注：传感器在采集时需要时间,主机发出测量指令（0xAC）后,延时75毫秒以上再读取转换后的数据并判断返回的状
+		// 态位是否正常。
+		base->delayms_sta_count ++;
+		if(base->delayms_sta_count >= 100){
+			base->delayms_sta_count = 0;
+		}else{
+			return 2;
+		}
+		if(base->AhtIicRead == 0){
+			return 1;//错误 没有调用AHT额外的接口函数
+		}
+		base->AhtIicRead(ReadBuf,6);
+		if(0x80 & ReadBuf[0] ){
+			return 1;
+		}
 		
-		hump = (hump|ReadBuf[1])<<8;
-		hump = (hump|ReadBuf[2])<<8;
-		hump = (hump|ReadBuf[3]);
-		hump = hump >>4;
+		hump |= (0XFF&(ReadBuf[1]));hump <<= 8;
+		hump |= (0XFF&(ReadBuf[2]));hump <<= 4;
+		hump |= ((ReadBuf[3]&0xf0) >> 4);
 		
-		temp = (temp|ReadBuf[3])<<8;
-		temp = (temp|ReadBuf[4])<<8;
-		temp = (temp|ReadBuf[5]);
-		temp = temp&0xfffff;	
+		temp |= (ReadBuf[3]&0x0f); temp <<= 8;
+		temp |= (0XFF&(ReadBuf[4])); temp <<= 8;
+		temp |= (0XFF&(ReadBuf[5]));
 
-		*temp_adcval = hump*100.0/1024.0/1024.0;  //计算得到湿度值
-		*rh_adcva = temp *200.0*10.0/1024.0/1024.0-500;//计算得到温度值
+		base->temperature = *temp_adcval = temp *200.0/1024.0/1024.0-50;//计算得到温度值
+		base->humidity = *rh_adcval = hump*100.0/1024.0/1024.0;  //计算得到湿度值
 		
 		return 0;
 	}		
@@ -181,7 +211,7 @@ void SetSht3xPeriodicMode(SHT3X_DEV* base,uint8_t mps,uint8_t refresh)			//设�
 		index = 0;
 	}
 
-	base->write(base->dev_addr,Measurementcommands[index],buf,0);
+	base->write(base->i2cdev_addr,Measurementcommands[index],buf,0);
 }
 
 
