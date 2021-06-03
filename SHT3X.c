@@ -38,6 +38,7 @@ static uint16_t SHT3X_crc8(unsigned char *addr,uint8_t num);
 * 说    明: 由于SHTX是使用双字节地址，所以需要实现双地址的i2c接口，
   			不采用crc校验。降低i2c通信速率可以得到很好的数据
 ************************************************************************/
+uint8_t temp_a[2] = {0};
 uint8_t Sht3xInit(SHT3X_DEV* base,
 	void (*read)(uint8_t,uint16_t,uint8_t*,uint8_t),
 	void (*write)(uint8_t,uint16_t,uint8_t*,uint8_t),
@@ -68,6 +69,18 @@ uint8_t Sht3xInit(SHT3X_DEV* base,
 		// 5.4 软复位这个命令（见表9）用于在无需关闭和再次打开电源的情况下，重新启动传感器系统。在接收到这个命令之后，
 		// 传感器系统开始重新初始化，并恢复默认设置状态，软复位所需时间不超过20毫秒。
 		base->write(base->i2cdev_addr,0xe1,temp,2);
+	}else if(base->sh_dev_type == HTU21D){
+
+		base->Htu21dIic_write_devaddr = 0;//初始化函数不需要用到读取数据的函数
+		base->Htu21dIic_read_devaddr = 0;//初始化函数不需要用到读取数据的函数
+		base->HTU21D_read_sta = IDLE;
+		base->HTU21D_read_sta_count = 0;
+		// 使用No Hold Master模式
+		base->i2cdev_addr = 0x40;
+		Sht3xSoftReset(base);
+		// 默认使用12bit rh 14bit temp
+		// base->read(base->i2cdev_addr,0xE7,temp_a,1);
+
 	}
 	return 0;
 }
@@ -108,6 +121,10 @@ void Sht3xSoftReset(SHT3X_DEV* base)
 		temp = 0x30A2;
 	}else if(base->sh_dev_type == AHTX){
 		temp = 0xba;		
+	}else if(base->sh_dev_type == HTU21D){
+		uint8_t temp[2] = {0x00};
+		base->write(base->i2cdev_addr,0xFE,temp,0);//复位操作
+		return ;		
 	}
 	base->write(base->i2cdev_addr,temp,&buf,0);
 }
@@ -186,7 +203,70 @@ int Sht3xTemperatureHumidity(SHT3X_DEV* base,float *temp_adcval,float *rh_adcval
 		base->humidity = *rh_adcval = hump*100.0/1024.0/1024.0;  //计算得到湿度值
 		
 		return 0;
-	}		
+	}else if(base->sh_dev_type == HTU21D){
+		if(base->Htu21dIic_write_devaddr == 0 || base->Htu21dIic_read_devaddr == 0){
+			return 1;
+		}
+		// Trigger Temperature Measurement 0xF3 No Hold master
+		// base->read(base->i2cdev_addr,0xF3,ReadBuf,3);
+		// Trigger Humidity Measurement 0xF5 No Hold master
+		switch(base->HTU21D_read_sta){
+			case IDLE:{
+			// 1先发送对应的温度命令，
+				base->Htu21dIic_write_devaddr(0xf3);
+				base->HTU21D_read_sta = TEMPCMD_SENDED;
+			/*当sda设置浮空输入 芯片带有上拉时候 芯片无法改变数据到0！*/
+			/*这是SCL的问题，sda 输出模式OD 带上拉 SCL需要设置成PP模式才可以 */
+			/*我估计是芯片太弱了*/
+			}break;
+			case TEMPCMD_SENDED:{
+				base->delayms(1);//大概要40ms才有数据
+				base->Htu21dIic_read_devaddr(ReadBuf,3);
+				// if(SHT3X_crc8(ReadBuf,2) == ReadBuf[2]){
+				if(0XFF != ReadBuf[0]){//不用CRC了 在线算的都和手册不一样，
+					uint16_t temp_rh = ReadBuf[0];temp_rh <<=8;temp_rh |= ReadBuf[1];
+					base->temperature = (float)temp_rh/65536.0*175.72-46.85;
+
+					base->Htu21dIic_write_devaddr(0xf5);
+					base->HTU21D_read_sta = RHCMD_SENDED;
+					base->HTU21D_read_sta_count = 0;
+					base->goodrh_crc_count ++;
+				}else{
+					if((base->HTU21D_read_sta_count++) >= 60){
+						base->HTU21D_read_sta_count = 0;
+						base->HTU21D_read_sta = IDLE;
+						base->badrh_crc_count ++;
+					}
+				}
+			}break;
+			case RHCMD_SENDED:{
+				base->delayms(1);//大概要40ms才有数据
+				base->Htu21dIic_read_devaddr(ReadBuf,3);
+				if(0XFF != ReadBuf[0]){//不用CRC了 在线算的都和手册不一样，
+					uint16_t temp_rh = ReadBuf[0];temp_rh <<=8;temp_rh |= ReadBuf[1];
+					base->humidity = 125.0*(float)temp_rh/65536.0-6.0;
+					
+					base->HTU21D_read_sta = IDLE;
+					*temp_adcval = base->temperature;
+					*rh_adcval = base->humidity;
+					base->HTU21D_read_sta_count = 0;
+					base->goodtp_crc_count ++;
+					return 0;
+				}else{
+					if((base->HTU21D_read_sta_count++) >= 60){
+						base->HTU21D_read_sta_count = 0;
+						base->HTU21D_read_sta = IDLE;
+						base->badtp_crc_count ++;
+					}
+				}
+			}break;
+		}
+		
+		// 1.5等待
+		// 2得到对应的温度湿度，
+
+		return 2;
+	}
 }
 
 //***********************************************************************************************
@@ -243,3 +323,12 @@ static uint16_t SHT3X_crc8(unsigned char *addr,uint8_t num)
 	return(crc);                    		// Return updated CRC   
 }
 
+// 使用HTU21D时候会用到非标准IIC接口，为什么这些烂东西会自己想一个IIC接口，还申明是标准IIC !!!
+void Sht3xInitAddInterface_HTU21D(SHT3X_DEV* base,
+	// 参数uint8_t 是命令
+	void(*Htu21dIic_write_devaddr)(uint8_t),//参考手册读取温度一节。在模拟iic程序中有做函数接口。
+	// 参数uint8_t *温湿度缓冲区,uint16_t，长度
+	void(*Htu21dIic_read_devaddr)(uint8_t *,uint16_t)){
+	base->Htu21dIic_write_devaddr = Htu21dIic_write_devaddr;
+	base->Htu21dIic_read_devaddr = Htu21dIic_read_devaddr;
+}
